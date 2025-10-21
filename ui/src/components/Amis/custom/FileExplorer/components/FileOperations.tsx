@@ -138,37 +138,79 @@ export class FileOperations {
 
         const uploadInput = document.createElement('input');
         uploadInput.type = 'file';
+        uploadInput.multiple = true; // Enable multiple file selection
         uploadInput.onchange = async (e) => {
-            const file = (e.target as HTMLInputElement).files?.[0];
-            if (!file) return;
+            const files = (e.target as HTMLInputElement).files;
+            if (!files || files.length === 0) return;
 
-            const formData = new FormData();
-            formData.append('file', file);
-            formData.append('containerName', this.props.selectedContainer);
-            formData.append('podName', this.props.podName);
-            formData.append('namespace', this.props.namespace);
-            formData.append('isDir', String(node.isDir));
-            formData.append('path', String(node.path));
-            formData.append('fileName', file.name);
+            const fileArray = Array.from(files);
+            const totalFiles = fileArray.length;
+            let successCount = 0;
+            let failedCount = 0;
+            const failedFiles: string[] = [];
 
-            try {
-                const url = ProcessK8sUrlWithCluster('/k8s/file/upload');
-                const response = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('token')}`
-                    },
-                    body: formData
-                });
-                const result = await response.json();
-                if (result.data?.file?.status === 'done') {
-                    message.success('上传成功');
-                    onUploadSuccess();
-                } else {
-                    message.error(result.data?.file?.error || '上传失败');
+            // Show initial message for batch upload
+            if (totalFiles > 1) {
+                message.info(`开始上传 ${totalFiles} 个文件...`);
+            }
+
+            // Upload files sequentially to avoid overwhelming the server
+            for (let i = 0; i < fileArray.length; i++) {
+                const file = fileArray[i];
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('containerName', this.props.selectedContainer);
+                formData.append('podName', this.props.podName);
+                formData.append('namespace', this.props.namespace);
+                formData.append('isDir', String(node.isDir));
+                formData.append('path', String(node.path));
+                formData.append('fileName', file.name);
+
+                try {
+                    const url = ProcessK8sUrlWithCluster('/k8s/file/upload');
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${localStorage.getItem('token')}`
+                        },
+                        body: formData
+                    });
+                    const result = await response.json();
+                    if (result.data?.file?.status === 'done') {
+                        successCount++;
+                        if (totalFiles === 1) {
+                            message.success('上传成功');
+                        }
+                    } else {
+                        failedCount++;
+                        failedFiles.push(file.name);
+                        if (totalFiles === 1) {
+                            message.error(result.data?.file?.error || '上传失败');
+                        }
+                    }
+                } catch (error) {
+                    failedCount++;
+                    failedFiles.push(file.name);
+                    if (totalFiles === 1) {
+                        message.error('上传失败');
+                    }
                 }
-            } catch (error) {
-                message.error('上传失败');
+            }
+
+            // Show summary message for batch upload
+            if (totalFiles > 1) {
+                if (failedCount === 0) {
+                    message.success(`成功上传 ${successCount} 个文件`);
+                } else if (successCount === 0) {
+                    message.error(`上传失败：${failedFiles.join(', ')}`);
+                } else {
+                    message.warning(`上传完成：${successCount} 个成功，${failedCount} 个失败（${failedFiles.join(', ')}）`);
+                }
+            }
+
+            // Refresh the file tree if at least one file was uploaded successfully
+            if (successCount > 0) {
+                onUploadSuccess();
             }
         };
         uploadInput.click();
