@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/gin-gonic/gin"
@@ -20,6 +22,25 @@ import (
 
 type FileController struct{}
 
+// BatchUploadResult represents the result of a batch upload operation
+type BatchUploadResult struct {
+	TotalFiles   int                    `json:"total_files"`
+	SuccessCount int                    `json:"success_count"`
+	FailureCount int                    `json:"failure_count"`
+	Files        []FileUploadResult     `json:"files"`
+	Duration     time.Duration          `json:"duration"`
+	StartTime    time.Time              `json:"start_time"`
+	EndTime      time.Time              `json:"end_time"`
+}
+
+// FileUploadResult represents the result of a single file upload
+type FileUploadResult struct {
+	FileName string `json:"file_name"`
+	Status   string `json:"status"` // "done", "error"
+	Error    string `json:"error,omitempty"`
+	Size     int64  `json:"size"`
+}
+
 func RegisterPodFileRoutes(api *gin.RouterGroup) {
 	ctrl := &FileController{}
 	api.POST("/file/list", ctrl.List)
@@ -27,6 +48,7 @@ func RegisterPodFileRoutes(api *gin.RouterGroup) {
 	api.POST("/file/save", ctrl.Save)
 	api.GET("/file/download", ctrl.Download)
 	api.POST("/file/upload", ctrl.Upload)
+	api.POST("/file/batch-upload", ctrl.BatchUpload) // New batch upload endpoint
 	api.POST("/file/delete", ctrl.Delete)
 }
 
@@ -40,6 +62,157 @@ type info struct {
 	FileName      string `json:"fileName,omitempty"`
 	Size          int64  `json:"size,omitempty"`
 	FileType      string `json:"type,omitempty"` // 只有file类型可以查、下载
+}
+
+// BatchUpload 处理批量上传文件的 HTTP 请求
+// @Summary 批量上传文件
+// @Security BearerAuth
+// @Param cluster query string true "集群名称"
+// @Param containerName formData string true "容器名称"
+// @Param namespace formData string true "命名空间"
+// @Param podName formData string true "Pod名称"
+// @Param path formData string true "文件路径"
+// @Param files formData file true "上传文件列表"
+// @Success 200 {object} BatchUploadResult
+// @Router /k8s/cluster/{cluster}/file/batch-upload [post]
+func (fc *FileController) BatchUpload(c *gin.Context) {
+	selectedCluster, err := amis.GetSelectedCluster(c)
+	if err != nil {
+		amis.WriteJsonError(c, err)
+		return
+	}
+
+	info := &info{}
+	info.ContainerName = c.PostForm("containerName")
+	info.Namespace = c.PostForm("namespace")
+	info.PodName = c.PostForm("podName")
+	info.Path = c.PostForm("path")
+
+	if info.ContainerName == "" || info.Namespace == "" || info.PodName == "" || info.Path == "" {
+		amis.WriteJsonError(c, fmt.Errorf("缺少必要参数: containerName, namespace, podName, path"))
+		return
+	}
+
+	// 获取上传的文件列表
+	form, err := c.MultipartForm()
+	if err != nil {
+		amis.WriteJsonError(c, fmt.Errorf("获取上传文件错误: %v", err))
+		return
+	}
+
+	files := form.File["files"]
+	if len(files) == 0 {
+		amis.WriteJsonError(c, fmt.Errorf("没有找到上传的文件"))
+		return
+	}
+
+	// 限制批量上传文件数量
+	maxFiles := 50
+	if len(files) > maxFiles {
+		amis.WriteJsonError(c, fmt.Errorf("批量上传文件数量不能超过 %d 个", maxFiles))
+		return
+	}
+
+	ctx := amis.GetContextWithUser(c)
+	result := fc.processBatchUpload(ctx, selectedCluster, info, files)
+
+	amis.WriteJsonData(c, result)
+}
+
+// processBatchUpload 处理批量上传逻辑
+func (fc *FileController) processBatchUpload(ctx context.Context, selectedCluster string, info *info, files []*multipart.FileHeader) BatchUploadResult {
+	startTime := time.Now()
+	result := BatchUploadResult{
+		TotalFiles: len(files),
+		Files:      make([]FileUploadResult, len(files)),
+		StartTime:  startTime,
+	}
+
+	// 并发控制 - 最多同时处理5个文件
+	semaphore := make(chan struct{}, 5)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for i, file := range files {
+		wg.Add(1)
+		go func(index int, f *multipart.FileHeader) {
+			defer wg.Done()
+			
+			// 获取信号量
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			fileResult := fc.uploadSingleFile(ctx, selectedCluster, info, f)
+			
+			// 线程安全地更新结果
+			mu.Lock()
+			result.Files[index] = fileResult
+			if fileResult.Status == "done" {
+				result.SuccessCount++
+			} else {
+				result.FailureCount++
+			}
+			mu.Unlock()
+		}(i, file)
+	}
+
+	wg.Wait()
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+
+	klog.V(4).Infof("Batch upload completed: %d total, %d success, %d failed, duration: %v", 
+		result.TotalFiles, result.SuccessCount, result.FailureCount, result.Duration)
+
+	return result
+}
+
+// uploadSingleFile 上传单个文件
+func (fc *FileController) uploadSingleFile(ctx context.Context, selectedCluster string, info *info, file *multipart.FileHeader) FileUploadResult {
+	fileResult := FileUploadResult{
+		FileName: file.Filename,
+		Size:     file.Size,
+	}
+
+	// 验证文件名
+	if file.Filename == "" {
+		fileResult.Status = "error"
+		fileResult.Error = "文件名不能为空"
+		return fileResult
+	}
+
+	// 替换文件名中非法字符
+	sanitizedFileName := utils.SanitizeFileName(file.Filename)
+	if sanitizedFileName != file.Filename {
+		klog.V(4).Infof("Sanitized filename: %s -> %s", file.Filename, sanitizedFileName)
+	}
+
+	// 保存上传文件到临时位置
+	tempFilePath, err := saveUploadedFile(file)
+	if err != nil {
+		fileResult.Status = "error"
+		fileResult.Error = fmt.Sprintf("保存临时文件失败: %v", err)
+		return fileResult
+	}
+	defer os.Remove(tempFilePath) // 确保清理临时文件
+
+	// 创建新的info结构用于单个文件上传
+	singleFileInfo := &info{
+		ContainerName: info.ContainerName,
+		Namespace:     info.Namespace,
+		PodName:       info.PodName,
+		Path:          filepath.Join(info.Path, sanitizedFileName),
+		FileName:      sanitizedFileName,
+	}
+
+	// 上传文件到 Pod
+	if err := uploadToPod(ctx, selectedCluster, singleFileInfo, tempFilePath); err != nil {
+		fileResult.Status = "error"
+		fileResult.Error = fmt.Sprintf("上传到Pod失败: %v", err)
+		return fileResult
+	}
+
+	fileResult.Status = "done"
+	return fileResult
 }
 
 // List  处理获取文件列表的 HTTP 请求
