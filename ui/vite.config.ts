@@ -2,6 +2,8 @@ import {defineConfig} from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import monacoEditorPlugin from 'vite-plugin-monaco-editor';
+// @ts-ignore
+import istanbul from 'vite-plugin-istanbul'
 import {copy} from 'fs-extra'
 
 export default defineConfig(({mode}) => {
@@ -126,6 +128,12 @@ export default defineConfig(({mode}) => {
             monacoEditorPlugin({
                 publicPath: '/monacoeditorwork', // 静态资源输出路径
             }),
+            ...(process.env.E2E_COVERAGE ? [istanbul({
+                include: 'src/**/*',
+                extension: ['.ts', '.tsx'],
+                cypress: false,
+                requireEnv: false
+            })] : []),
             /**
              * 自定义插件：处理 POST 请求并打印请求信息
              */

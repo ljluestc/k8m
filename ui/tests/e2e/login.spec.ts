@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test'
+import { test, expect } from './fixtures'
 
 test('login flow with mocked backend', async ({ page }) => {
     await page.route('**/auth/sso/config', async route => {
