@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v1.61.0
+    hooks:
+      - id: golangci-lint
+        args: ["--timeout=5m"]
+  - repo: local
+    hooks:
+      - id: go-test
+        name: go test with coverage
+        entry: bash -c "go test ./... -coverprofile=coverage.out"
+        language: system
+        pass_filenames: false
+      - id: ui-lint
+        name: ui lint
+        entry: bash -c "cd ui && pnpm i --silent && pnpm lint"
+        language: system
+        pass_filenames: false
+      - id: ui-unit
+        name: ui unit tests
+        entry: bash -c "cd ui && pnpm i --silent && pnpm test:run -- --reporter=dot"
+        language: system
+        pass_filenames: false
+
+
